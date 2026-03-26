@@ -63,7 +63,8 @@
   "Specify the style to open new buffer for editing."
   :type '(choice (const :tag "Open buffer with full window" full)
                  (const :tag "Open buffer with splitted window" split)
-                 (const :tag "Open buffer with new frame" frame))
+                 (const :tag "Open buffer with new frame" frame)
+                 (const :tag "Open buffer with emacsclient frame" emacsclient))
   :group 'atomic-chrome)
 
 (defcustom atomic-chrome-buffer-frame-width 80
@@ -380,6 +381,9 @@ off."
 Each element has a list consisting of (websocket, frame, (url,
 title, extension)).")
 
+(defvar-local atomic-chrome--emacsclient-buffer nil
+  "Non-nil when current Atomic Chrome buffer was displayed by emacsclient.")
+
 (defun atomic-chrome-get-websocket (buffer)
   "Look up websocket associated with buffer BUFFER.
 Looks in `atomic-chrome-buffer-table'."
@@ -394,6 +398,13 @@ Looks in `atomic-chrome-buffer-table'."
   "Look up information like url, title, extension associated with buffer BUFFER.
 Looks in `atomic-chrome-buffer-table'."
   (nth 2 (gethash buffer atomic-chrome-buffer-table)))
+
+(defun atomic-chrome-set-frame (buffer frame)
+  "Store FRAME as the display frame associated with BUFFER."
+  (when-let* ((entry (gethash buffer atomic-chrome-buffer-table)))
+    (setf (nth 1 entry) frame)
+    (puthash buffer entry atomic-chrome-buffer-table)
+    frame))
 
 (defun atomic-chrome-get-buffer-by-socket (socket)
   "Look up buffer which is associated to the websocket SOCKET.
@@ -607,10 +618,8 @@ Argument STR is the string from which a substring is extracted.
 Argument MAX-WIDTH is the maximum length of the substring to extract."
   (substring str 0 (min (length str) max-width)))
 
-(defun atomic-chrome--make-frame (&optional rect)
-  "Create a new frame for Atomic Chrome with specified parameters.
-
-Argument TITLE is a string representing the title of the frame.
+(defun atomic-chrome--frame-parameters (&optional rect)
+  "Return frame parameters for Atomic Chrome, optionally derived from RECT.
 
 Optional argument RECT is an alist containing pixel dimensions and positions for
 the frame.
@@ -633,6 +642,14 @@ positioning the frame near the area being edited."
                    (assq 'top frame-params)))
       (when (not (cdr (assq 'user-position frame-params)))
         (push '(user-position . t) frame-params)))
+    frame-params))
+
+(defun atomic-chrome--make-frame (&optional rect)
+  "Create a new frame for Atomic Chrome with specified parameters.
+
+Optional argument RECT is an alist containing pixel dimensions and positions for
+the frame."
+  (let ((frame-params (atomic-chrome--frame-parameters rect)))
     (cond ((memq window-system '(pgtk x))
            (if (or (not x-display-name)
                    (string-match-p "wayland" x-display-name))
@@ -651,6 +668,81 @@ positioning the frame near the area being edited."
           (t
            (make-frame frame-params)))))
 
+(defun atomic-chrome--emacsclient-command (buffer &optional rect)
+  "Return command line arguments to display BUFFER via emacsclient.
+
+Optional argument RECT is an alist containing pixel dimensions and positions for
+the editing frame."
+  (let ((buffer-name (buffer-name buffer)))
+    (unless buffer-name
+      (error "Atomic Chrome: buffer has no name for emacsclient"))
+    (list "emacsclient"
+          "-n"
+          "-c"
+          "-q"
+          "-u"
+          "-F"
+          (prin1-to-string (atomic-chrome--frame-parameters rect))
+          "-e"
+          (prin1-to-string
+           `(atomic-chrome--display-buffer-in-client-frame ,buffer-name)))))
+
+(defun atomic-chrome--display-buffer-in-client-frame (buffer-name)
+  "Display BUFFER-NAME in the current emacsclient-created frame."
+  (let ((buffer (get-buffer buffer-name)))
+    (unless buffer
+      (error "Atomic Chrome: missing buffer %s" buffer-name))
+    (switch-to-buffer buffer)
+    (with-current-buffer buffer
+      (setq-local atomic-chrome--emacsclient-buffer t)
+      (atomic-chrome-emacsclient-edit-mode 1)
+      (atomic-chrome-set-frame buffer (selected-frame)))
+    (raise-frame (selected-frame))
+    (select-frame-set-input-focus (selected-frame))
+    (selected-frame)))
+
+(defun atomic-chrome--open-buffer-with-emacsclient (buffer &optional rect)
+  "Display BUFFER inside an emacsclient frame.
+
+Optional argument RECT is an alist containing pixel dimensions and positions for
+the editing frame."
+  (when (buffer-local-value 'buffer-file-name buffer)
+    (error "Atomic Chrome: emacsclient open style only supports buffer strategy"))
+  (let* ((command (atomic-chrome--emacsclient-command buffer rect))
+         (program (car command))
+         (args (cdr command))
+         (output-buffer (generate-new-buffer " *atomic-chrome-emacsclient*")))
+    (unless (executable-find program)
+      (kill-buffer output-buffer)
+      (error "Atomic Chrome: could not find `%s` in PATH" program))
+    (unwind-protect
+        (let* ((process-connection-type nil)
+               (proc (make-process
+                      :name "atomic-chrome-emacsclient"
+                      :buffer output-buffer
+                      :command command
+                      :noquery t))
+               (deadline (+ (float-time) 5)))
+          (while (and (process-live-p proc)
+                      (< (float-time) deadline))
+            (accept-process-output proc 0.1))
+          (when (process-live-p proc)
+            (delete-process proc)
+            (error "Atomic Chrome: emacsclient timed out"))
+          (let ((status (process-exit-status proc))
+                (output (string-trim (with-current-buffer output-buffer
+                                       (buffer-string)))))
+            (unless (zerop status)
+              (error "Atomic Chrome: `%s %s` failed%s"
+                     program
+                     (string-join args " ")
+                     (if (string-empty-p output)
+                         ""
+                       (format ": %s" output)))))
+          (or (atomic-chrome-get-frame buffer)
+              (error "Atomic Chrome: emacsclient did not register a frame")))
+      (kill-buffer output-buffer))))
+
 (defun atomic-chrome-show-edit-buffer (buffer _title &optional rect)
   "Open or switch to an edit BUFFER, setting its dimensions as specified.
 
@@ -661,16 +753,20 @@ cause an error due to a resource key that is too long.
 
 Optional argument RECT is an alist containing pixel dimensions and positions for
 the editing frame."
-  (let ((edit-frame (and (eq atomic-chrome-buffer-open-style 'frame)
-                         (atomic-chrome--make-frame rect))))
-    (when edit-frame
-      (select-frame edit-frame))
-    (if (eq atomic-chrome-buffer-open-style 'split)
-        (pop-to-buffer buffer)
-      (switch-to-buffer buffer))
-    (raise-frame edit-frame)
-    (select-frame-set-input-focus (window-frame (selected-window)))
-    edit-frame))
+  (pcase atomic-chrome-buffer-open-style
+    ('emacsclient
+     (atomic-chrome--open-buffer-with-emacsclient buffer rect))
+    (_
+     (let ((edit-frame (and (eq atomic-chrome-buffer-open-style 'frame)
+                            (atomic-chrome--make-frame rect))))
+       (when edit-frame
+         (select-frame edit-frame))
+       (if (eq atomic-chrome-buffer-open-style 'split)
+           (pop-to-buffer buffer)
+         (switch-to-buffer buffer))
+       (raise-frame edit-frame)
+       (select-frame-set-input-focus (window-frame (selected-window)))
+       edit-frame))))
 
 
 (defun atomic-chrome-normalize-file-extension (file-extension)
@@ -893,17 +989,18 @@ the cursor at."
                                          atomic-chrome-max-filename-size)))))
     (with-current-buffer buffer
       (puthash buffer
-               (list socket (atomic-chrome-show-edit-buffer
-                             buffer title
-                             rect)
-                     (list url title extension))
+               (list socket nil (list url title extension))
                atomic-chrome-buffer-table)
+      (setq-local atomic-chrome--emacsclient-buffer nil)
       (let ((buffer-undo-list t))
         (insert text))
       (when (and file atomic-chrome-make-file-save-initial-contents)
         (save-buffer))
       (atomic-chrome-set-major-mode url)
-      (atomic-chrome--goto-position line column))))
+      (atomic-chrome--goto-position line column)
+      (atomic-chrome-set-frame
+       buffer
+       (atomic-chrome-show-edit-buffer buffer title rect)))))
 
 (defun atomic-chrome-close-edit-buffer (buffer)
   "Close buffer BUFFER if it's one of Atomic Chrome edit buffers."
@@ -1151,6 +1248,17 @@ associated Emacs buffers for editing."
     map)
   "Keymap for minor mode `atomic-chrome-edit-mode'.")
 
+(defvar atomic-chrome-emacsclient-edit-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-x C-c") #'atomic-chrome-close-current-buffer)
+    map)
+  "Keymap for Atomic Chrome buffers displayed via emacsclient.")
+
+(define-minor-mode atomic-chrome-emacsclient-edit-mode
+  "Minor mode for Atomic Chrome buffers displayed via emacsclient."
+  :lighter nil
+  :keymap atomic-chrome-emacsclient-edit-mode-map)
+
 
 (defun atomic-chrome-unset-buffer-modified ()
   "Mark buffer as unmodified and return true."
@@ -1163,13 +1271,18 @@ associated Emacs buffers for editing."
   :lighter " AtomicChrome"
   :init-value nil
   :keymap atomic-chrome-edit-mode-map
-  (when atomic-chrome-edit-mode
-    (add-hook 'kill-buffer-hook #'atomic-chrome-close-connection nil t)
-    (add-hook 'kill-buffer-query-functions
-              #'atomic-chrome-unset-buffer-modified nil t)
-    (when atomic-chrome-enable-auto-update
-      (add-hook 'post-command-hook #'atomic-chrome--send-buffer-text
-                nil t))))
+  (if atomic-chrome-edit-mode
+      (progn
+        (if atomic-chrome--emacsclient-buffer
+            (atomic-chrome-emacsclient-edit-mode 1)
+          (atomic-chrome-emacsclient-edit-mode -1))
+        (add-hook 'kill-buffer-hook #'atomic-chrome-close-connection nil t)
+        (add-hook 'kill-buffer-query-functions
+                  #'atomic-chrome-unset-buffer-modified nil t)
+        (when atomic-chrome-enable-auto-update
+          (add-hook 'post-command-hook #'atomic-chrome--send-buffer-text
+                    nil t)))
+    (atomic-chrome-emacsclient-edit-mode -1)))
 
 (put 'atomic-chrome-edit-mode 'permanent-local t)
 

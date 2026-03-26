@@ -241,14 +241,22 @@ The available values are as follows:
 - =full=: Opens in the selected window.
 - =split=: Opens in a new window by splitting the selected window (default).
 - =frame=: Creates a new frame and a window within it.
+- =emacsclient=: Creates a new client frame via =emacsclient= and displays the editing buffer there.
 
 The =frame= option is available only when using Emacs on a window system.
+
+The =emacsclient= option is intended for users who already run Emacs as a server and want Atomic Chrome to reuse the same display/backend selection behavior as =emacsclient -c=. It currently supports buffers created with =atomic-chrome-create-file-strategy= set to =buffer=; file-backed strategies are rejected with an error.
 
 If you select =frame=, you can set the width and height of the frame with =atomic-chrome-buffer-frame-width= and =atomic-chrome-buffer-frame-height=, and the rest of the frame parameters can be customized with =atomic-chrome-frame-parameters=.
 
 #+begin_quote
 [!TIP]
 By default, Atomic Chrome tries to automatically calculate the =left= and =top= positions of the frame based on the position of the textarea in the browser. You can disable this by adding these parameters to =atomic-chrome-frame-parameters=, which take precedence.
+#+end_quote
+
+#+begin_quote
+[!NOTE]
+When using =emacsclient=, =C-x C-c= is rebound only in Atomic Chrome buffers opened with this style so that it closes the current Atomic Chrome session instead of exiting Emacs.
 #+end_quote
 
 ** File Creation
