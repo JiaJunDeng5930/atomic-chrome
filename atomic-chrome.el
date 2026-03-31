@@ -101,6 +101,11 @@ Note: This setting overrides `atomic-chrome-frame-parameters'."
   :type 'integer
   :group 'atomic-chrome)
 
+(defcustom atomic-chrome-buffer-coding-system 'utf-8-dos
+  "Coding system used for Atomic Chrome edit buffers."
+  :type 'coding-system
+  :group 'atomic-chrome)
+
 (defcustom atomic-chrome-frame-parameters '((alpha-background . 90)
                                             (fullscreen . nil)
                                             (fullboth . nil))
@@ -503,17 +508,26 @@ positions, both using zero-based indexing."
   (list (cons "selections" (atomic-chrome-get-selections))))
 
 (defun atomic-chrome-normalize-text-from-client (text)
-  "Normalize TEXT received from the browser client to use LF line endings."
-  (replace-regexp-in-string "\r\n?" "\n" text t t))
+  "Decode TEXT received from the browser client using current buffer coding."
+  (let ((coding-system (or buffer-file-coding-system
+                           atomic-chrome-buffer-coding-system)))
+    (with-temp-buffer
+      (setq-local buffer-file-coding-system coding-system)
+      (insert text)
+      (let ((coding-system-for-read coding-system))
+        (decode-coding-region (point-min) (point-max) coding-system-for-read))
+      (buffer-string))))
 
 (defun atomic-chrome-normalize-text-for-client (text)
-  "Normalize TEXT sent to the browser client to use CRLF line endings."
-  (replace-regexp-in-string
-   "\n"
-   "\r\n"
-   (atomic-chrome-normalize-text-from-client text)
-   t
-   t))
+  "Encode TEXT sent to the browser client using current buffer coding."
+  (let ((coding-system (or buffer-file-coding-system
+                           atomic-chrome-buffer-coding-system)))
+    (with-temp-buffer
+      (setq-local buffer-file-coding-system coding-system)
+      (insert text)
+      (let ((coding-system-for-write coding-system))
+        (encode-coding-region (point-min) (point-max) coding-system-for-write))
+      (buffer-string))))
 
 (defun atomic-chrome-get-update-text-payload ()
   "Return alist with text and, optionally, cursor position and selections.
@@ -1006,6 +1020,7 @@ the cursor at."
                (list socket nil (list url title extension))
                atomic-chrome-buffer-table)
       (setq-local atomic-chrome--emacsclient-buffer nil)
+      (setq-local buffer-file-coding-system atomic-chrome-buffer-coding-system)
       (let ((buffer-undo-list t))
         (insert (atomic-chrome-normalize-text-from-client text)))
       (when (and file atomic-chrome-make-file-save-initial-contents)
