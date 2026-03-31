@@ -502,6 +502,19 @@ Each alist in the vector represents a selection with `start' and `end'
 positions, both using zero-based indexing."
   (list (cons "selections" (atomic-chrome-get-selections))))
 
+(defun atomic-chrome-normalize-text-from-client (text)
+  "Normalize TEXT received from the browser client to use LF line endings."
+  (replace-regexp-in-string "\r\n?" "\n" text t t))
+
+(defun atomic-chrome-normalize-text-for-client (text)
+  "Normalize TEXT sent to the browser client to use CRLF line endings."
+  (replace-regexp-in-string
+   "\n"
+   "\r\n"
+   (atomic-chrome-normalize-text-from-client text)
+   t
+   t))
+
 (defun atomic-chrome-get-update-text-payload ()
   "Return alist with text and, optionally, cursor position and selections.
 
@@ -532,9 +545,10 @@ formats."
   (save-excursion
     (save-restriction
       (widen)
-      (let ((data (list (cons "text" (buffer-substring-no-properties
-                                      (point-min)
-                                      (point-max)))))
+      (let ((data (list (cons "text" (atomic-chrome-normalize-text-for-client
+                                      (buffer-substring-no-properties
+                                       (point-min)
+                                       (point-max))))))
             (size))
         (when (or (eq atomic-chrome-max-text-size-for-position-sync t)
                   (and atomic-chrome-max-text-size-for-position-sync
@@ -993,7 +1007,7 @@ the cursor at."
                atomic-chrome-buffer-table)
       (setq-local atomic-chrome--emacsclient-buffer nil)
       (let ((buffer-undo-list t))
-        (insert text))
+        (insert (atomic-chrome-normalize-text-from-client text)))
       (when (and file atomic-chrome-make-file-save-initial-contents)
         (save-buffer))
       (atomic-chrome-set-major-mode url)
@@ -1059,6 +1073,7 @@ after the update."
   (let ((buffer (atomic-chrome-get-buffer-by-socket socket)))
     (when buffer
       (with-current-buffer buffer
+        (setq text (atomic-chrome-normalize-text-from-client text))
         (unless (string= (buffer-string) text)
           (erase-buffer)
           (insert text))
